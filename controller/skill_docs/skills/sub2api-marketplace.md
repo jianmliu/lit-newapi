@@ -25,6 +25,11 @@ Use One API as a quota marketplace: buy balance with Base USDC, quote available 
 - If the One API token has `sub2_api_source_id`, explicit binding overrides the cheapest-source recommendation (see `sub2api-inference`).
 - Retry inference only according to One API and upstream HTTP status. Do not retry `POST /api/sub2api/buy` without a fresh x402 authorization unless the client implements its own idempotency boundary.
 
+## x402 payment header
+- If `POST /api/sub2api/buy` is missing `X-PAYMENT`, One API returns HTTP 402 plus `X-PAYMENT-REQUIRED` JSON containing `version: "x402-1"`, `scheme: "eip-3009"`, `amount`, and, when configured, `chain_id`, `usdc_address`, and `pay_to`.
+- Retry with `X-PAYMENT` set to a JSON EIP-3009 authorization signed for the exact `amount` in USDC atoms; underpayment and overpayment are both rejected.
+- The authorization recipient (`to`) must be the `pay_to` hot wallet and the EIP-712 domain must use the configured USDC contract as `verifyingContract`.
+
 ## Example quote request
 ```http
 GET /api/sub2api/marketplace/quote?model=gpt-4.1-mini&estimated_quota=3000

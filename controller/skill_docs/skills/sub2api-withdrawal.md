@@ -23,14 +23,14 @@ Content-Type: application/json
 - `payout_method`: `base_usdc` to settle on Base via the operator hot wallet, or other configured methods.
 - `payout_account`: recipient address / external account ID for the chosen method.
 
-Returns the created `Withdrawal` row: `id`, `user_id`, `quota`, `currency`, `payout_method`, `payout_account`, `status` (initially `pending`), `created_at`.
+Returns the created `Withdrawal` row: `id`, `user_id`, `quota`, `amount`, `currency`, `payout_method`, `payout_account`, `status` (initially `pending`), `tx_hash`, `created_time`, and `updated_time`.
 
 ### List your withdrawals
 ```http
 GET /api/user/withdrawals
 Authorization: Bearer <one_api_access_token>
 ```
-Returns all withdrawal rows for the current user, including ones already approved, rejected, or settled. Status transitions are monotonic: `pending → approved → settled` or `pending → rejected → refunded`.
+Returns all withdrawal rows for the current user, including ones already approved or rejected. Status transitions are monotonic: `pending → processing → approved` for automatic payouts, `pending → approved` for manual approvals, or `pending → rejected` with a quota refund.
 
 ### (Admin) inspect any withdrawal
 ```http
@@ -47,7 +47,7 @@ Content-Type: application/json
 
 { "status": "approved", "remark": "manual review ok" }
 ```
-Approving with `payout_method=base_usdc` triggers an automatic Base USDC payout from the operator hot wallet (see `controller/withdrawal.go:shouldPayoutBaseUSDC`); the resulting Ethereum tx hash is appended to the withdrawal record. Rejecting refunds the locked quota back to the seller.
+Approving with any non-`manual` payout method routes through the configured Sub2API payment provider (`controller/withdrawal.go:dispatchWithdrawalPayout`); for `self_hosted`, this sends a Base USDC payout from the operator hot wallet and appends the Ethereum tx hash to the withdrawal record. Rejecting refunds the locked quota back to the seller.
 
 ## Response envelope
 All endpoints return `{ "success": bool, "message": string, "data": ... }`. Errors set `success=false`.
@@ -55,7 +55,7 @@ All endpoints return `{ "success": bool, "message": string, "data": ... }`. Erro
 ## Safety rules
 - The withdrawal endpoint debits the seller's balance on submit, not on approve. Cancelling a pending request is admin-only via the reject path; agents must not retry on transient errors.
 - `payout_account` is opaque to One API — the agent is responsible for supplying a valid address / account ID for the chosen `payout_method`.
-- Base USDC payouts are sent from a single hot wallet configured server-side. If the wallet is unfunded the payout fails closed; the withdrawal stays `approved` without a tx hash and an operator must retry.
+- Base USDC payouts are sent from a single hot wallet configured server-side. If the wallet is unfunded or the provider is unavailable, approval fails closed and the withdrawal returns to `pending` for a later retry.
 - Treat the `id` of a created withdrawal as the only reliable handle; status polling is idempotent and safe.
 
 ## Related skills
