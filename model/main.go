@@ -283,6 +283,7 @@ func migrateDB() error {
 		&PerfMetric{},
 		&Sub2APISource{},
 		&Sub2APISourceGrant{},
+		&Withdrawal{},
 	)
 	if err != nil {
 		return err
