@@ -23,6 +23,7 @@ func SetApiRouter(router *gin.Engine) {
 		sub2APIRoute := apiRouter.Group("/sub2api")
 		sub2APIRoute.Use(middleware.UserAuth())
 		{
+			sub2APIRoute.GET("/pricing", controller.GetSub2APIPricing)
 			sub2APIRoute.GET("/sources", controller.ListSub2APISources)
 			sub2APIRoute.GET("/available-sources", controller.ListAvailableSub2APISources)
 			sub2APIRoute.GET("/sources/:id/grants", controller.ListSub2APISourceGrants)
