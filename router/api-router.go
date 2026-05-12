@@ -20,6 +20,15 @@ func SetApiRouter(router *gin.Engine) {
 	{
 		apiRouter.GET("/sub2api/llms.txt", controller.GetSub2APIAgentLLMS)
 		apiRouter.GET("/sub2api/skills/:name", controller.GetSub2APIAgentSkill)
+		sub2APIRoute := apiRouter.Group("/sub2api")
+		sub2APIRoute.Use(middleware.UserAuth())
+		{
+			sub2APIRoute.GET("/sources", controller.ListSub2APISources)
+			sub2APIRoute.GET("/available-sources", controller.ListAvailableSub2APISources)
+			sub2APIRoute.GET("/sources/:id/grants", controller.ListSub2APISourceGrants)
+			sub2APIRoute.POST("/sources/:id/grants", controller.GrantSub2APISource)
+			sub2APIRoute.DELETE("/sources/:id/grants/:user_id", controller.RevokeSub2APISourceGrant)
+		}
 		apiRouter.GET("/setup", controller.GetSetup)
 		apiRouter.POST("/setup", controller.PostSetup)
 		apiRouter.GET("/status", controller.GetStatus)
