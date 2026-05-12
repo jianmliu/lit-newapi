@@ -131,6 +131,10 @@ func SetApiRouter(router *gin.Engine) {
 				// Custom OAuth bindings
 				selfRoute.GET("/oauth/bindings", controller.GetUserOAuthBindings)
 				selfRoute.DELETE("/oauth/bindings/:provider_id", controller.UnbindCustomOAuth)
+
+				// Sub2API marketplace seller payouts
+				selfRoute.GET("/withdrawals", controller.GetSelfWithdrawals)
+				selfRoute.POST("/withdrawals", controller.CreateWithdrawal)
 			}
 
 			adminRoute := userRoute.Group("/")
