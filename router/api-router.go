@@ -20,6 +20,8 @@ func SetApiRouter(router *gin.Engine) {
 	{
 		apiRouter.GET("/sub2api/llms.txt", controller.GetSub2APIAgentLLMS)
 		apiRouter.GET("/sub2api/skills/:name", controller.GetSub2APIAgentSkill)
+		apiRouter.GET("/withdrawal", middleware.AdminAuth(), controller.GetAllWithdrawals)
+		apiRouter.PUT("/withdrawal/:id", middleware.AdminAuth(), controller.UpdateWithdrawal)
 		sub2APIRoute := apiRouter.Group("/sub2api")
 		sub2APIRoute.Use(middleware.UserAuth())
 		{
