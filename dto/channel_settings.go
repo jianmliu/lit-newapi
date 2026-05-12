@@ -41,6 +41,8 @@ type ChannelOtherSettings struct {
 	UpstreamModelUpdateLastDetectedModels []string      `json:"upstream_model_update_last_detected_models,omitempty"` // 上次检测到的可加入模型
 	UpstreamModelUpdateLastRemovedModels  []string      `json:"upstream_model_update_last_removed_models,omitempty"`  // 上次检测到的可删除模型
 	UpstreamModelUpdateIgnoredModels      []string      `json:"upstream_model_update_ignored_models,omitempty"`       // 手动忽略的模型
+	Sub2APIEndpointID                     string        `json:"sub2api_endpoint_id,omitempty"`                        // Sub2API marketplace: endpoint id supplied to the upstream Sub2API runtime
+	Sub2APIRuntimeKeyEnv                  string        `json:"sub2api_runtime_key_env,omitempty"`                    // Sub2API marketplace: env var name from which the per-request runtime key is read
 }
 
 func (s *ChannelOtherSettings) IsOpenRouterEnterprise() bool {
