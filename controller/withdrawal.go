@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"errors"
+	"math"
 	"math/big"
 	"net/http"
 	"strconv"
@@ -118,14 +120,24 @@ func dispatchWithdrawalPayout(c *gin.Context, withdrawal *model.Withdrawal) (str
 	if method == "manual" {
 		return "", nil
 	}
-	provider, err := sub2APINewPaymentProvider(c.Request.Context())
+	claimed, err := model.ClaimWithdrawalForPayout(withdrawal.Id)
 	if err != nil {
 		return "", err
 	}
-	defer provider.Close()
-	amount := big.NewInt(withdrawal.Quota)
-	txHash, err := provider.PayoutUSDC(c.Request.Context(), strings.TrimSpace(withdrawal.PayoutAccount), amount)
+	provider, err := sub2APINewPaymentProvider(c.Request.Context())
 	if err != nil {
+		_ = model.ResetWithdrawalPayout(c.Request.Context(), withdrawal.Id, err.Error())
+		return "", err
+	}
+	defer provider.Close()
+	amountAtoms := int64(math.Round(claimed.Amount * float64(usdcAtomsPerDollar)))
+	if amountAtoms <= 0 {
+		_ = model.ResetWithdrawalPayout(c.Request.Context(), withdrawal.Id, "invalid Base USDC payout amount")
+		return "", errors.New("invalid Base USDC payout amount")
+	}
+	txHash, err := provider.PayoutUSDC(c.Request.Context(), strings.TrimSpace(claimed.PayoutAccount), big.NewInt(amountAtoms))
+	if err != nil {
+		_ = model.ResetWithdrawalPayout(c.Request.Context(), withdrawal.Id, err.Error())
 		return "", err
 	}
 	return txHash, nil

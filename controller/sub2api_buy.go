@@ -5,10 +5,14 @@ import (
 	"math"
 	"math/big"
 	"net/http"
+	"os"
 	"strconv"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	x402 "github.com/QuantumNous/new-api/controller/x402auth"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/ethereum/go-ethereum/crypto"
 
 	"github.com/gin-gonic/gin"
 )
@@ -94,13 +98,22 @@ func BuySub2APIQuota(c *gin.Context) {
 
 func writeSub2APIX402Required(c *gin.Context, expectedAtoms int64, expectedUSD float64) {
 	payload := gin.H{
-		"version":     "1",
+		"version":     x402.Version,
 		"scheme":      "eip-3009",
 		"asset":       "USDC",
 		"network":     "base",
 		"amount":      strconv.FormatInt(expectedAtoms, 10),
 		"amount_usdc": expectedUSD,
 		"message":     "x402 payment required",
+	}
+	if chainID := strings.TrimSpace(os.Getenv("SUB2API_CHAIN_ID")); chainID != "" {
+		payload["chain_id"] = chainID
+	}
+	if usdcAddress := strings.TrimSpace(os.Getenv("SUB2API_USDC_ADDRESS")); usdcAddress != "" {
+		payload["usdc_address"] = usdcAddress
+	}
+	if hotWalletAddress, err := hotWalletAddressFromPrivateKeyEnv("SUB2API_HOT_WALLET_PRIVATE_KEY"); err == nil {
+		payload["pay_to"] = hotWalletAddress
 	}
 	if encoded, err := common.Marshal(payload); err == nil {
 		c.Header("X-PAYMENT-REQUIRED", string(encoded))
@@ -110,4 +123,16 @@ func writeSub2APIX402Required(c *gin.Context, expectedAtoms int64, expectedUSD f
 		"message": "x402 payment required",
 		"payment": payload,
 	})
+}
+
+func hotWalletAddressFromPrivateKeyEnv(name string) (string, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return "", os.ErrNotExist
+	}
+	key, err := crypto.HexToECDSA(strings.TrimPrefix(raw, "0x"))
+	if err != nil {
+		return "", err
+	}
+	return crypto.PubkeyToAddress(key.PublicKey).Hex(), nil
 }

@@ -26,6 +26,8 @@ type fakeSub2APIPaymentProvider struct {
 	payoutErr     error
 	captureCalls  int
 	payoutCalls   int
+	payoutTo      string
+	payoutAmount  *big.Int
 }
 
 func (f *fakeSub2APIPaymentProvider) CaptureX402(_ context.Context, _ string, _ *big.Int) (string, error) {
@@ -33,8 +35,12 @@ func (f *fakeSub2APIPaymentProvider) CaptureX402(_ context.Context, _ string, _ 
 	return f.captureTxHash, f.captureErr
 }
 
-func (f *fakeSub2APIPaymentProvider) PayoutUSDC(_ context.Context, _ string, _ *big.Int) (string, error) {
+func (f *fakeSub2APIPaymentProvider) PayoutUSDC(_ context.Context, to string, amount *big.Int) (string, error) {
 	f.payoutCalls++
+	f.payoutTo = to
+	if amount != nil {
+		f.payoutAmount = new(big.Int).Set(amount)
+	}
 	return f.payoutTxHash, f.payoutErr
 }
 
@@ -311,5 +317,49 @@ func TestWithdrawal_ApproveNonManualWithoutProviderFails(t *testing.T) {
 	}
 	if reloaded.Status != model.WithdrawalStatusPending {
 		t.Fatalf("withdrawal status = %q, want pending (no settlement path)", reloaded.Status)
+	}
+}
+
+func TestWithdrawal_ApproveBaseUSDCPayoutConvertsQuotaToUSDCAtoms(t *testing.T) {
+	db := openSub2APITestDB(t)
+	originalQuotaPerUnit := common.QuotaPerUnit
+	common.QuotaPerUnit = 500_000
+	t.Cleanup(func() { common.QuotaPerUnit = originalQuotaPerUnit })
+	userID := seedSub2APITestUser(t, db, 1_000_000)
+	withdrawal, err := model.CreateWithdrawal(context.Background(), userID, 500_000, "USDC", "base_usdc", "0x1000000000000000000000000000000000000001")
+	if err != nil {
+		t.Fatalf("create withdrawal: %v", err)
+	}
+
+	fake := &fakeSub2APIPaymentProvider{payoutTxHash: "0xpayout"}
+	restore := controller.SetSub2APIPaymentProviderForTest(func(context.Context) (controller.Sub2APIPaymentProvider, error) {
+		return fake, nil
+	})
+	t.Cleanup(restore)
+
+	r := gin.New()
+	r.PUT("/api/withdrawal/:id", controller.UpdateWithdrawal)
+	req := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/withdrawal/%d", withdrawal.Id), strings.NewReader(`{"status":"approved","remark":""}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"success":true`) {
+		t.Fatalf("approve status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if fake.payoutCalls != 1 {
+		t.Fatalf("PayoutUSDC called %d times, want 1", fake.payoutCalls)
+	}
+	if fake.payoutTo != "0x1000000000000000000000000000000000000001" {
+		t.Fatalf("payout to = %q", fake.payoutTo)
+	}
+	if fake.payoutAmount == nil || fake.payoutAmount.Cmp(big.NewInt(1_000_000)) != 0 {
+		t.Fatalf("payout amount = %v, want 1000000 USDC atoms", fake.payoutAmount)
+	}
+	var updated model.Withdrawal
+	if err := db.First(&updated, withdrawal.Id).Error; err != nil {
+		t.Fatalf("reload withdrawal: %v", err)
+	}
+	if updated.Status != model.WithdrawalStatusApproved || updated.TxHash != "0xpayout" {
+		t.Fatalf("withdrawal after payout = %+v", updated)
 	}
 }
