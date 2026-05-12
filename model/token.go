@@ -28,6 +28,7 @@ type Token struct {
 	UsedQuota          int            `json:"used_quota" gorm:"default:0"` // used quota
 	Group              string         `json:"group" gorm:"default:''"`
 	CrossGroupRetry    bool           `json:"cross_group_retry"` // 跨分组重试，仅auto分组有效
+	Sub2APISourceId    int            `json:"sub2_api_source_id" gorm:"default:0;index"`
 	DeletedAt          gorm.DeletedAt `gorm:"index"`
 }
 
