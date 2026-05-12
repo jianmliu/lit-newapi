@@ -1,7 +1,7 @@
 package controller
 
 import (
-	"errors"
+	"math/big"
 	"net/http"
 	"strconv"
 	"strings"
@@ -106,16 +106,27 @@ func UpdateWithdrawal(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": updated})
 }
 
-// dispatchWithdrawalPayout is a placeholder for the future payment-provider
-// router (Stripe / Creem / Base USDC). For now it only succeeds when the
-// caller explicitly opts into a manual payout by setting payout_method to
-// 'manual'; any other payout_method returns 'not configured' so admins
-// cannot accidentally approve a withdrawal that has no settlement path.
-// Base USDC + EIP-3009 capture lands together with sub2api_buy.go.
+// dispatchWithdrawalPayout routes the approved withdrawal through the
+// configured Sub2API payment provider. The 'manual' payout method is a
+// special case that records an out-of-band settlement without consulting a
+// provider (tx_hash stays empty). Any other payout_method goes through
+// sub2APINewPaymentProvider; if the provider is not configured or returns
+// an error the withdrawal stays unapproved so admins cannot accidentally
+// settle through a missing backend.
 func dispatchWithdrawalPayout(c *gin.Context, withdrawal *model.Withdrawal) (string, error) {
 	method := strings.ToLower(strings.TrimSpace(withdrawal.PayoutMethod))
 	if method == "manual" {
 		return "", nil
 	}
-	return "", errors.New("payout method '" + withdrawal.PayoutMethod + "' is not configured")
+	provider, err := sub2APINewPaymentProvider(c.Request.Context())
+	if err != nil {
+		return "", err
+	}
+	defer provider.Close()
+	amount := big.NewInt(withdrawal.Quota)
+	txHash, err := provider.PayoutUSDC(c.Request.Context(), strings.TrimSpace(withdrawal.PayoutAccount), amount)
+	if err != nil {
+		return "", err
+	}
+	return txHash, nil
 }
