@@ -26,6 +26,7 @@ func SetApiRouter(router *gin.Engine) {
 		sub2APIRoute.Use(middleware.UserAuth())
 		{
 			sub2APIRoute.GET("/pricing", controller.GetSub2APIPricing)
+			sub2APIRoute.POST("/buy", controller.BuySub2APIQuota)
 			sub2APIRoute.GET("/marketplace/quote", controller.QuoteSub2APIMarketplace)
 			sub2APIRoute.GET("/sources", controller.ListSub2APISources)
 			sub2APIRoute.GET("/available-sources", controller.ListAvailableSub2APISources)
