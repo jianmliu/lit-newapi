@@ -10,9 +10,10 @@ constant/api_type.go                      APITypeSub2API     (before APITypeDumm
 controller/skill_docs/                    Agent-discoverable skill markdown (llms.txt + 7 skills)
 controller/sub2api_skill_docs.go          //go:embed serving of skill_docs
 controller/sub2api_skill_docs_test.go     Endpoint smoke test
-controller/sub2api_source.go              (pending) source registry + marketplace quote + buy
-controller/withdrawal.go                  (pending) seller payout submit + admin processing
-controller/payment_provider.go            (pending) x402 payment provider interface
+controller/sub2api_source.go              source registry + marketplace quote + buy
+controller/withdrawal.go                  seller payout submit + admin processing
+controller/payment_provider.go            x402 payment provider interface + self_hosted provider
+controller/x402auth/                      EIP-3009 verification, calldata packing, EVM submit helpers
 dto/channel_settings.go                   +Sub2APIEndpointID, +Sub2APIRuntimeKeyEnv on ChannelOtherSettings
 model/sub2api_source.go                   Sub2APISource + Sub2APISourceGrant + helpers
 model/withdrawal.go                       Withdrawal four-state machine
@@ -21,7 +22,7 @@ relay/channel/sub2api/adaptor.go          Embeds openai.Adaptor + Sub2API GetCha
 relay/channel/sub2api/config.go           RuntimeConfig + FromChannelOther + RuntimeRequestURL
 middleware/sub2api_runtime.go             (pending) per-request runtime key issue/revoke against Sub2API admin API
 router/api-router.go                      /api/sub2api/llms.txt, /api/sub2api/skills/:name registered
-                                          (pending) /api/sub2api/{pricing,sources,grants,quota,usage,buy,marketplace/quote}, /api/user/withdrawals, /api/withdrawal
+                                          /api/sub2api/{pricing,sources,grants,quota,usage,buy,marketplace/quote}, /api/user/withdrawals, /api/withdrawal
 web/{default,classic}/dist/index.html     Frontend embed placeholders (replaced by the Dockerfile bun build)
 SUB2API.md                                This file
 ```
@@ -72,6 +73,19 @@ New API never persists:
 - Sub2API runtime keys (minted per request, revoked after the relay completes)
 - Sealed credential references' contents (only opaque IDs)
 - Raw request or response bodies (Sub2API stores SHA-256 hashes only)
+
+## Self-hosted x402 payment provider
+
+Set `SUB2API_PAYMENT_PROVIDER=self_hosted` and configure:
+
+```bash
+SUB2API_USDC_ADDRESS=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
+SUB2API_CHAIN_ID=8453
+SUB2API_HOT_WALLET_PRIVATE_KEY=0x...
+SUB2API_EVM_RPC_URL=https://...
+```
+
+The provider verifies x402 EIP-3009 signatures against the configured USDC EIP-712 domain, requires the exact expected USDC atom amount, submits `transferWithAuthorization` on capture, and sends seller payouts with ERC-20 `transfer(address,uint256)`. Withdrawal payouts claim the row before broadcasting and reset it to `pending` if the payout path fails.
 
 ## Agent self-learning entry point
 
