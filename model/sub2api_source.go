@@ -71,6 +71,12 @@ func GetSub2APISourceByIds(id int, userID int) (*Sub2APISource, error) {
 	return &source, err
 }
 
+func GetSub2APISourceByEndpointID(endpointID string) (*Sub2APISource, error) {
+	source := Sub2APISource{}
+	err := DB.Where("endpoint_id = ?", endpointID).First(&source).Error
+	return &source, err
+}
+
 func GetUsableSub2APISourceForUser(id int, userID int) (*Sub2APISource, error) {
 	source := Sub2APISource{Id: id}
 	err := DB.Where(
