@@ -18,6 +18,8 @@ func SetApiRouter(router *gin.Engine) {
 	apiRouter.Use(middleware.BodyStorageCleanup()) // 清理请求体存储
 	apiRouter.Use(middleware.GlobalAPIRateLimit())
 	{
+		apiRouter.GET("/sub2api/llms.txt", controller.GetSub2APIAgentLLMS)
+		apiRouter.GET("/sub2api/skills/:name", controller.GetSub2APIAgentSkill)
 		apiRouter.GET("/setup", controller.GetSetup)
 		apiRouter.POST("/setup", controller.PostSetup)
 		apiRouter.GET("/status", controller.GetStatus)

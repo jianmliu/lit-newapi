@@ -1,0 +1,49 @@
+# One API — Sub2API Agent Skill Specification
+
+## Purpose
+One API is the OpenAI-compatible gateway for the Sub2API marketplace and runtime. Agents can register and share their own Sub2API endpoint sources, buy and audit quota, route inference at the cheapest eligible source, withdraw earnings as sellers, and verify each call's TEE attestation — all via REST without a browser.
+
+## Decision flow
+1. Discover capabilities through `GET /api/sub2api/llms.txt` and `GET /api/sub2api/skills/{name}`.
+2. Authenticate with a One API access token (Bearer). Buy quota with x402 Base USDC when balance is low.
+3. Register or accept access to a source, then call `POST /v1/chat/completions` like any OpenAI client.
+4. Audit per-call evidence at `GET /sub2api/v1/attest/{call_id}` (Sub2API server, not One API).
+5. Sellers withdraw revenue via `POST /api/user/withdrawals`.
+
+## Authentication
+All `/api/*` routes require `Authorization: Bearer <one_api_access_token>` unless explicitly marked public. `POST /api/sub2api/buy` additionally requires `X-PAYMENT` with an x402 EIP-3009 Base USDC authorization. Sub2API runtime / attest routes are served by the Sub2API server and use a Sub2API endpoint API key (`Authorization: Bearer <key_id>.<raw>` or `x-api-key`).
+
+## Skills
+| Skill | Endpoints | Description |
+|---|---|---|
+| `sub2api-marketplace` | `GET /api/sub2api/pricing`, `GET /api/sub2api/marketplace/quote`, `POST /api/sub2api/buy`, `POST /v1/chat/completions` | Discover purchase terms, quote endpoint capacity, buy quota with x402, route inference. |
+| `sub2api-sources` | `GET /api/sub2api/sources`, `GET /api/sub2api/available-sources`, `POST /api/sub2api/sources`, `DELETE /api/sub2api/sources/:id` | Register, list, and delete Sub2API source rows the caller owns or has been granted. |
+| `sub2api-grants` | `GET /api/sub2api/sources/:id/grants`, `POST /api/sub2api/sources/:id/grants`, `DELETE /api/sub2api/sources/:id/grants/:user_id` | Share a source with another One API user, list current grants, and revoke. |
+| `sub2api-quota-usage` | `GET /api/sub2api/sources/:id/quota`, `GET /api/sub2api/sources/:id/usage` | Inspect remaining quota and historical usage for a specific source. |
+| `sub2api-inference` | `POST /v1/chat/completions` (and the rest of the OpenAI-compatible surface) | Run the actual model call, read the `X-Sub2API-*` metering headers, and recognize source-binding semantics. |
+| `sub2api-withdrawal` | `POST /api/user/withdrawals`, `GET /api/user/withdrawals` | Sellers (source owners) request and track payouts of accrued source-owner revenue. |
+| `sub2api-attest` | `GET /sub2api/v1/attest/{call_id}` | Fetch the TEE evidence record for a specific call: request/response hashes, signed `evidence_hash`, image hash, and boot quote hash. Verifiable off-chain with `ecrecover`. |
+
+## Product JSON
+One API does not publish standalone `/facts.json`, `/pricing.json`, or `/status.json` files. Use the skill endpoints listed above as the live machine-readable sources.
+
+## Errors
+API routes use the One API envelope: `{ "success": false, "message": "..." }`. Missing x402 payment returns HTTP `402 Payment Required` with a payment object and `X-PAYMENT-REQUIRED` header. Sub2API runtime errors return upstream-compatible JSON; the runtime metering headers are stripped from inference responses before they reach the agent.
+
+## Rate limits
+Routes are governed by the One API global API limiter plus per-token quota. Agents that receive HTTP `402` must pay or stop; agents that receive HTTP `429` must honor `Retry-After` when present.
+
+## Privacy and retention
+Skill responses intentionally omit Sub2API tenant IDs, credential IDs, endpoint IDs, runtime key IDs, and runtime tokens. Inference requests use request-scoped runtime keys that are revoked after relay completion. Sub2API does not persist raw request or response bodies — only SHA-256 hashes.
+
+## Versioning
+Project version: 0.2.0-draft. Breaking external changes after publication require a new major route or versioned schema path.
+
+## Where to look next
+- `/api/sub2api/skills/sub2api-marketplace`
+- `/api/sub2api/skills/sub2api-sources`
+- `/api/sub2api/skills/sub2api-grants`
+- `/api/sub2api/skills/sub2api-quota-usage`
+- `/api/sub2api/skills/sub2api-inference`
+- `/api/sub2api/skills/sub2api-withdrawal`
+- `/api/sub2api/skills/sub2api-attest`
