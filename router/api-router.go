@@ -30,6 +30,7 @@ func SetApiRouter(router *gin.Engine) {
 			sub2APIRoute.GET("/marketplace/quote", controller.QuoteSub2APIMarketplace)
 			sub2APIRoute.GET("/sources", controller.ListSub2APISources)
 			sub2APIRoute.GET("/available-sources", controller.ListAvailableSub2APISources)
+			sub2APIRoute.POST("/sources/deposit-estimate", controller.EstimateSub2APISourceDeposit)
 			sub2APIRoute.POST("/sources", controller.CreateSub2APISource)
 			sub2APIRoute.DELETE("/sources/:id", controller.DeleteSub2APISource)
 			sub2APIRoute.GET("/sources/:id/quota", controller.GetSub2APISourceQuota)

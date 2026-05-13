@@ -30,7 +30,14 @@ type sub2APISourceCreateRequest struct {
 	QuotaLimitTotalUnits uint64         `json:"quota_limit_total_units"`
 	QuotaLimitDayUnits   uint64         `json:"quota_limit_day_units"`
 	RateLimitPerMinute   uint64         `json:"rate_limit_per_minute"`
+	DepositQuota         int            `json:"deposit_quota"`
+	IdempotencyKey       string         `json:"idempotency_key"`
 	Credential           map[string]any `json:"credential"`
+}
+
+type sub2APISourceDepositEstimateRequest struct {
+	CommittedTokens int    `json:"committed_tokens"`
+	DepositPolicyID string `json:"deposit_policy_id"`
 }
 
 func ListSub2APISources(c *gin.Context) {
@@ -49,6 +56,37 @@ func ListAvailableSub2APISources(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": sources})
+}
+
+func EstimateSub2APISourceDeposit(c *gin.Context) {
+	var req sub2APISourceDepositEstimateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	if req.CommittedTokens <= 0 {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": "committed_tokens must be positive"})
+		return
+	}
+	if strings.TrimSpace(req.DepositPolicyID) == "" {
+		req.DepositPolicyID = "default-v1"
+	}
+	available, err := model.GetUserAvailableQuota(c.GetInt("id"))
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	locked, err := model.GetUserProviderLockedQuota(c.GetInt("id"))
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": gin.H{
+		"required_deposit":  req.CommittedTokens,
+		"available_balance": available,
+		"locked_balance":    locked,
+		"deposit_policy_id": req.DepositPolicyID,
+	}})
 }
 
 func loadUserSub2APISource(c *gin.Context) (*model.Sub2APISource, bool) {
@@ -137,6 +175,31 @@ func CreateSub2APISource(c *gin.Context) {
 	credentialID := "cred-" + suffix
 	endpointID := "endpoint-" + suffix
 	keyID := "key-" + suffix
+	var depositLock *model.ProviderEndpointDepositLock
+	if req.DepositQuota > 0 {
+		depositLock, err = model.LockProviderEndpointDeposit(userID, req.DepositQuota, req.IdempotencyKey)
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
+			return
+		}
+		if depositLock.SourceId > 0 {
+			source, err := model.GetSub2APISourceByIds(depositLock.SourceId, userID)
+			if err != nil {
+				c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": gin.H{
+				"source":            source,
+				"idempotent_replay": true,
+			}})
+			return
+		}
+	}
+	unlockDepositOnFailure := func() {
+		if depositLock != nil {
+			_ = model.UnlockProviderEndpointDeposit(depositLock.Id)
+		}
+	}
 	tenantName := fmt.Sprintf("One API user %d", userID)
 	credential := req.Credential
 	if credential == nil {
@@ -157,6 +220,7 @@ func CreateSub2APISource(c *gin.Context) {
 		"quota_source":    req.QuotaSource,
 		"credential":      credential,
 	}); err != nil {
+		unlockDepositOnFailure()
 		c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
 		return
 	}
@@ -169,6 +233,7 @@ func CreateSub2APISource(c *gin.Context) {
 		"model":         req.Model,
 		"base_url":      req.BaseURL,
 	}); err != nil {
+		unlockDepositOnFailure()
 		c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
 		return
 	}
@@ -182,6 +247,7 @@ func CreateSub2APISource(c *gin.Context) {
 		"rate_limit_per_minute":   req.RateLimitPerMinute,
 	})
 	if err != nil {
+		unlockDepositOnFailure()
 		c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
 		return
 	}
@@ -199,8 +265,16 @@ func CreateSub2APISource(c *gin.Context) {
 		Status:          model.Sub2APISourceStatusActive,
 	}
 	if err = source.Insert(); err != nil {
+		unlockDepositOnFailure()
 		c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
 		return
+	}
+	if depositLock != nil {
+		if err = model.AttachProviderEndpointDepositLock(depositLock.Id, source.Id, source.EndpointID, ""); err != nil {
+			unlockDepositOnFailure()
+			c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
+			return
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": gin.H{
 		"source":        source,
@@ -218,7 +292,7 @@ func DeleteSub2APISource(c *gin.Context) {
 			"tenant_id": source.TenantID,
 		})
 	}
-	if err := model.DeleteSub2APISourceById(source.Id, c.GetInt("id")); err != nil {
+	if err := model.DeleteSub2APISourceByIdAndUnlockDeposit(source.Id, c.GetInt("id")); err != nil {
 		c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
 		return
 	}
@@ -272,6 +346,7 @@ func normalizeSub2APISourceCreateRequest(req *sub2APISourceCreateRequest) error 
 	req.BaseURL = strings.TrimSpace(req.BaseURL)
 	req.AccessToken = strings.TrimSpace(req.AccessToken)
 	req.APIKey = strings.TrimSpace(req.APIKey)
+	req.IdempotencyKey = strings.TrimSpace(req.IdempotencyKey)
 	req.CredentialType = strings.ToLower(strings.TrimSpace(req.CredentialType))
 	req.QuotaSource = strings.ToLower(strings.TrimSpace(req.QuotaSource))
 	if req.Name == "" || len(req.Name) > 64 {
@@ -313,6 +388,12 @@ func normalizeSub2APISourceCreateRequest(req *sub2APISourceCreateRequest) error 
 	}
 	if req.AccessToken == "" && req.APIKey == "" && credentialSecret(req.Credential) == "" {
 		return fmt.Errorf("access_token or api_key is required")
+	}
+	if req.DepositQuota < 0 {
+		return fmt.Errorf("deposit_quota must be non-negative")
+	}
+	if req.DepositQuota > 0 && req.IdempotencyKey == "" {
+		return fmt.Errorf("idempotency_key is required when deposit_quota is positive")
 	}
 	return nil
 }
