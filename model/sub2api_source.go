@@ -2,6 +2,7 @@ package model
 
 import (
 	"github.com/QuantumNous/new-api/common"
+	"gorm.io/gorm"
 )
 
 const (
@@ -138,4 +139,34 @@ func (source *Sub2APISource) UpdateStatus(status string, message string) error {
 
 func DeleteSub2APISourceById(id int, userID int) error {
 	return DB.Where("id = ? and user_id = ?", id, userID).Delete(&Sub2APISource{}).Error
+}
+
+func DeleteSub2APISourceByIdAndUnlockDeposit(id int, userID int) error {
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var lock ProviderEndpointDepositLock
+		result := tx.Where("source_id = ? AND status = ?", id, ProviderEndpointDepositStatusLocked).Limit(1).Find(&lock)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 1 {
+			unlockAmount := lock.Amount - lock.UnlockedAmount - lock.SlashedAmount
+			if unlockAmount < 0 {
+				unlockAmount = 0
+			}
+			update := tx.Model(&ProviderEndpointDepositLock{}).Where("id = ? AND status = ?", lock.Id, ProviderEndpointDepositStatusLocked).Updates(map[string]interface{}{
+				"status":          ProviderEndpointDepositStatusUnlocked,
+				"unlocked_amount": lock.UnlockedAmount + unlockAmount,
+				"updated_time":    common.GetTimestamp(),
+			})
+			if update.Error != nil {
+				return update.Error
+			}
+			if update.RowsAffected == 1 && unlockAmount > 0 {
+				if err := tx.Model(&User{}).Where("id = ?", lock.UserId).Update("provider_locked_quota", gorm.Expr("provider_locked_quota - ?", unlockAmount)).Error; err != nil {
+					return err
+				}
+			}
+		}
+		return tx.Where("id = ? and user_id = ?", id, userID).Delete(&Sub2APISource{}).Error
+	})
 }
