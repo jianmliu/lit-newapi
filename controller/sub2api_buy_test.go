@@ -58,7 +58,7 @@ func openSub2APITestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	if err := db.AutoMigrate(&model.User{}, &model.Token{}, &model.Withdrawal{}, &model.Log{}); err != nil {
+	if err := db.AutoMigrate(&model.User{}, &model.Token{}, &model.Withdrawal{}, &model.Log{}, &model.Sub2APISource{}, &model.ProviderEndpointDepositLock{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	model.DB = db
@@ -199,6 +199,158 @@ func TestBuySub2APIQuota_ProviderNotConfiguredReturns503(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "not configured") {
 		t.Fatalf("body missing configuration error: %s", rr.Body.String())
+	}
+}
+
+func TestCreateSub2APISource_LocksDepositAndDeleteUnlocks(t *testing.T) {
+	db := openSub2APITestDB(t)
+	userID := seedSub2APITestUser(t, db, 100)
+
+	management := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-admin" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/keys") {
+			_, _ = w.Write([]byte(`{"token":"runtime-token"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(management.Close)
+	t.Setenv("SUB2API_MANAGEMENT_BASE_URL", management.URL)
+	t.Setenv("SUB2API_MANAGEMENT_ADMIN_BEARER", "test-admin")
+
+	r := gin.New()
+	r.POST("/api/sub2api/sources", withUserContext(userID, controller.CreateSub2APISource))
+	r.DELETE("/api/sub2api/sources/:id", withUserContext(userID, controller.DeleteSub2APISource))
+
+	createBody := `{
+		"name":"provider source",
+		"provider":"openai",
+		"model":"gpt-4o-mini",
+		"base_url":"https://api.openai.com/v1",
+		"api_key":"sk-test",
+		"credential_type":"api_key",
+		"deposit_quota":80,
+		"idempotency_key":"source-create-1"
+	}`
+	rr := postJSON(t, r, "/api/sub2api/sources", nil, createBody)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"success":true`) {
+		t.Fatalf("create status = %d body=%s", rr.Code, rr.Body.String())
+	}
+
+	var user model.User
+	if err := db.First(&user, userID).Error; err != nil {
+		t.Fatalf("reload user: %v", err)
+	}
+	if user.ProviderLockedQuota != 80 {
+		t.Fatalf("provider_locked_quota after create = %d, want 80", user.ProviderLockedQuota)
+	}
+
+	var source model.Sub2APISource
+	if err := db.First(&source, "user_id = ?", userID).Error; err != nil {
+		t.Fatalf("reload source: %v", err)
+	}
+	var lock model.ProviderEndpointDepositLock
+	if err := db.First(&lock, "user_id = ?", userID).Error; err != nil {
+		t.Fatalf("reload lock: %v", err)
+	}
+	if lock.SourceId != source.Id || lock.EndpointID != source.EndpointID {
+		t.Fatalf("lock not attached to source; lock=%+v source=%+v", lock, source)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, fmt.Sprintf("/api/sub2api/sources/%d", source.Id), nil)
+	rr = httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"success":true`) {
+		t.Fatalf("delete status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if err := db.First(&user, userID).Error; err != nil {
+		t.Fatalf("reload user after delete: %v", err)
+	}
+	if user.ProviderLockedQuota != 0 {
+		t.Fatalf("provider_locked_quota after delete = %d, want 0", user.ProviderLockedQuota)
+	}
+}
+
+func TestCreateSub2APISource_IdempotentRetryDoesNotDoubleLockOrProvision(t *testing.T) {
+	db := openSub2APITestDB(t)
+	userID := seedSub2APITestUser(t, db, 100)
+	managementCalls := 0
+	management := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		managementCalls++
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/keys") {
+			_, _ = w.Write([]byte(`{"token":"runtime-token"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(management.Close)
+	t.Setenv("SUB2API_MANAGEMENT_BASE_URL", management.URL)
+	t.Setenv("SUB2API_MANAGEMENT_ADMIN_BEARER", "test-admin")
+
+	r := gin.New()
+	r.POST("/api/sub2api/sources", withUserContext(userID, controller.CreateSub2APISource))
+	body := `{
+		"name":"provider source",
+		"provider":"openai",
+		"model":"gpt-4o-mini",
+		"base_url":"https://api.openai.com/v1",
+		"api_key":"sk-test",
+		"credential_type":"api_key",
+		"deposit_quota":80,
+		"idempotency_key":"source-create-idempotent"
+	}`
+
+	first := postJSON(t, r, "/api/sub2api/sources", nil, body)
+	if first.Code != http.StatusOK || !strings.Contains(first.Body.String(), `"success":true`) {
+		t.Fatalf("first create status = %d body=%s", first.Code, first.Body.String())
+	}
+	second := postJSON(t, r, "/api/sub2api/sources", nil, body)
+	if second.Code != http.StatusOK || !strings.Contains(second.Body.String(), `"success":true`) {
+		t.Fatalf("second create status = %d body=%s", second.Code, second.Body.String())
+	}
+	if managementCalls != 3 {
+		t.Fatalf("management calls = %d, want 3 (no retry provisioning)", managementCalls)
+	}
+	var sourceCount int64
+	if err := db.Model(&model.Sub2APISource{}).Where("user_id = ?", userID).Count(&sourceCount).Error; err != nil {
+		t.Fatalf("count sources: %v", err)
+	}
+	if sourceCount != 1 {
+		t.Fatalf("source count = %d, want 1", sourceCount)
+	}
+	var user model.User
+	if err := db.First(&user, userID).Error; err != nil {
+		t.Fatalf("reload user: %v", err)
+	}
+	if user.ProviderLockedQuota != 80 {
+		t.Fatalf("provider_locked_quota = %d, want 80", user.ProviderLockedQuota)
+	}
+}
+
+func TestEstimateSub2APISourceDepositReportsAvailableAndLockedQuota(t *testing.T) {
+	db := openSub2APITestDB(t)
+	userID := seedSub2APITestUser(t, db, 100)
+	_, err := model.LockProviderEndpointDeposit(userID, 40, "existing-source")
+	if err != nil {
+		t.Fatalf("seed deposit lock: %v", err)
+	}
+
+	r := gin.New()
+	r.POST("/api/sub2api/sources/deposit-estimate", withUserContext(userID, controller.EstimateSub2APISourceDeposit))
+
+	rr := postJSON(t, r, "/api/sub2api/sources/deposit-estimate", nil, `{"committed_tokens":50,"deposit_policy_id":"default-v1"}`)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"success":true`) {
+		t.Fatalf("estimate status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	for _, want := range []string{`"required_deposit":50`, `"available_balance":60`, `"locked_balance":40`, `"deposit_policy_id":"default-v1"`} {
+		if !strings.Contains(rr.Body.String(), want) {
+			t.Fatalf("estimate response missing %s: %s", want, rr.Body.String())
+		}
 	}
 }
 
