@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
@@ -11,6 +12,8 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -44,6 +47,7 @@ func TestMain(m *testing.M) {
 		&model.Channel{},
 		&model.TopUp{},
 		&model.UserSubscription{},
+		&model.ProviderEndpointDepositLock{},
 	); err != nil {
 		panic("failed to migrate: " + err.Error())
 	}
@@ -65,6 +69,7 @@ func truncate(t *testing.T) {
 		model.DB.Exec("DELETE FROM channels")
 		model.DB.Exec("DELETE FROM top_ups")
 		model.DB.Exec("DELETE FROM user_subscriptions")
+		model.DB.Exec("DELETE FROM provider_endpoint_deposit_locks")
 	})
 }
 
@@ -182,6 +187,35 @@ func countLogs(t *testing.T) int64 {
 	var count int64
 	model.LOG_DB.Model(&model.Log{}).Count(&count)
 	return count
+}
+
+func ginTestContext() *gin.Context {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	return c
+}
+
+func TestNewBillingSession_WalletRespectsProviderLockedQuota(t *testing.T) {
+	truncate(t)
+	const userID = 11
+	seedUser(t, userID, 100)
+	_, err := model.LockProviderEndpointDeposit(userID, 80, "source-create-lock")
+	require.NoError(t, err)
+
+	c := ginTestContext()
+	relayInfo := &relaycommon.RelayInfo{
+		UserId:          userID,
+		ForcePreConsume: true,
+		IsPlayground:    true,
+	}
+	session, apiErr := NewBillingSession(c, relayInfo, 30)
+	if apiErr == nil {
+		t.Fatalf("NewBillingSession succeeded with session=%+v; want insufficient quota because 80 of 100 is provider-locked", session)
+	}
+	assert.Nil(t, session)
+	assert.Equal(t, types.ErrorCodeInsufficientUserQuota, apiErr.GetErrorCode())
+	assert.Equal(t, 100, getUserQuota(t, userID))
 }
 
 // ===========================================================================
