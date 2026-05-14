@@ -40,6 +40,21 @@ func Sub2APIRuntime() gin.HandlerFunc {
 		}
 		endpointID := strings.TrimSpace(other.Sub2APIEndpointID)
 		if endpointID == "" {
+			modelName := strings.TrimSpace(c.GetString("original_model"))
+			if modelName == "" {
+				c.Next()
+				return
+			}
+			peers, err := model.GetEligibleSub2APIPeerChannelsForModel(modelName)
+			if err != nil || len(peers) == 0 {
+				c.Next()
+				return
+			}
+			peer := peers[0]
+			other.Sub2APIEndpointID = peer.BackendID
+			common.SetContextKey(c, constant.ContextKeyChannelOtherSetting, other)
+			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, peer.PeerEndpointURL)
+			common.SetContextKey(c, constant.ContextKeySub2APIPeerChannelId, peer.Id)
 			c.Next()
 			return
 		}
