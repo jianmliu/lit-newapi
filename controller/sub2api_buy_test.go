@@ -3,6 +3,9 @@ package controller_test
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -58,7 +61,7 @@ func openSub2APITestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	if err := db.AutoMigrate(&model.User{}, &model.Token{}, &model.Withdrawal{}, &model.Log{}, &model.Sub2APISource{}, &model.ProviderEndpointDepositLock{}); err != nil {
+	if err := db.AutoMigrate(&model.User{}, &model.Token{}, &model.Withdrawal{}, &model.Log{}, &model.Sub2APISource{}, &model.Sub2APIPeerChannel{}, &model.ProviderEndpointDepositLock{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	model.DB = db
@@ -74,7 +77,8 @@ func openSub2APITestDB(t *testing.T) *gorm.DB {
 
 func seedSub2APITestUser(t *testing.T, db *gorm.DB, quota int) int {
 	t.Helper()
-	user := model.User{Username: "buyer", Quota: quota}
+	suffix := common.GetUUID()
+	user := model.User{Username: "buyer-" + suffix, AffCode: suffix, Quota: quota}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatalf("create user: %v", err)
 	}
@@ -95,6 +99,22 @@ func postJSON(t *testing.T, h http.Handler, path string, headers map[string]stri
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	return rr
+}
+
+func getHTTP(t *testing.T, h http.Handler, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	return rr
+}
+
+func deleteHTTP(t *testing.T, h http.Handler, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodDelete, path, nil)
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 	return rr
@@ -351,6 +371,663 @@ func TestEstimateSub2APISourceDepositReportsAvailableAndLockedQuota(t *testing.T
 		if !strings.Contains(rr.Body.String(), want) {
 			t.Fatalf("estimate response missing %s: %s", want, rr.Body.String())
 		}
+	}
+}
+
+func TestEstimateSub2APIPeerChannelDepositReportsAvailableAndLockedQuota(t *testing.T) {
+	db := openSub2APITestDB(t)
+	userID := seedSub2APITestUser(t, db, 100)
+	_, err := model.LockProviderEndpointDeposit(userID, 35, "existing-peer-source")
+	if err != nil {
+		t.Fatalf("seed deposit lock: %v", err)
+	}
+
+	r := gin.New()
+	r.POST("/api/sub2api/peer-channels/deposit-estimate", withUserContext(userID, controller.EstimateSub2APIPeerChannelDeposit))
+
+	rr := postJSON(t, r, "/api/sub2api/peer-channels/deposit-estimate", nil, `{"committed_tokens":45,"deposit_policy_id":"peer-default-v1"}`)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"success":true`) {
+		t.Fatalf("estimate status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	for _, want := range []string{`"required_deposit":45`, `"available_balance":65`, `"locked_balance":35`, `"deposit_policy_id":"peer-default-v1"`} {
+		if !strings.Contains(rr.Body.String(), want) {
+			t.Fatalf("estimate response missing %s: %s", want, rr.Body.String())
+		}
+	}
+}
+
+func TestCreateSub2APIPeerChannel_LocksDepositAndReturnsPendingChannel(t *testing.T) {
+	db := openSub2APITestDB(t)
+	userID := seedSub2APITestUser(t, db, 100)
+
+	r := gin.New()
+	r.POST("/api/sub2api/peer-channels", withUserContext(userID, controller.CreateSub2APIPeerChannel))
+
+	body := `{
+		"display_name":"peer one",
+		"peer_endpoint_url":"https://peer.example.com/sub2api",
+		"backend_id":"backend-1",
+		"peer_public_key":"ed25519-public-key",
+		"signature_scheme":"ed25519-v1",
+		"nonce_window_seconds":120,
+		"supported_models":["gpt-4o-mini"],
+		"model_mapping":{"gpt-4o-mini":"provider-model"},
+		"capacity_config":{"rpm":60},
+		"pricing_tier_id":"tier-default",
+		"deposit_quota":70,
+		"idempotency_key":"peer-channel-create-1"
+	}`
+	rr := postJSON(t, r, "/api/sub2api/peer-channels", nil, body)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"success":true`) {
+		t.Fatalf("create status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	for _, want := range []string{`"routing_status":"disabled"`, `"verification_status":"pending_verification"`, `"health_status":"unknown"`, `"required_deposit":70`} {
+		if !strings.Contains(rr.Body.String(), want) {
+			t.Fatalf("create response missing %s: %s", want, rr.Body.String())
+		}
+	}
+
+	var user model.User
+	if err := db.First(&user, userID).Error; err != nil {
+		t.Fatalf("reload user: %v", err)
+	}
+	if user.ProviderLockedQuota != 70 {
+		t.Fatalf("provider_locked_quota after create = %d, want 70", user.ProviderLockedQuota)
+	}
+	var channel model.Sub2APIPeerChannel
+	if err := db.First(&channel, "provider_user_id = ?", userID).Error; err != nil {
+		t.Fatalf("reload peer channel: %v", err)
+	}
+	var lock model.ProviderEndpointDepositLock
+	if err := db.First(&lock, "user_id = ?", userID).Error; err != nil {
+		t.Fatalf("reload lock: %v", err)
+	}
+	if lock.PeerChannelId != channel.Id || lock.SourceId != 0 || channel.DepositLockId != lock.Id {
+		t.Fatalf("lock not attached to peer channel; lock=%+v channel=%+v", lock, channel)
+	}
+}
+
+func TestCreateSub2APIPeerChannel_IdempotentRetryDoesNotDoubleLock(t *testing.T) {
+	db := openSub2APITestDB(t)
+	userID := seedSub2APITestUser(t, db, 100)
+
+	r := gin.New()
+	r.POST("/api/sub2api/peer-channels", withUserContext(userID, controller.CreateSub2APIPeerChannel))
+	body := `{
+		"display_name":"peer one",
+		"peer_endpoint_url":"https://peer.example.com/sub2api",
+		"backend_id":"backend-1",
+		"peer_public_key":"ed25519-public-key",
+		"supported_models":["gpt-4o-mini"],
+		"deposit_quota":70,
+		"idempotency_key":"peer-channel-create-idempotent"
+	}`
+
+	first := postJSON(t, r, "/api/sub2api/peer-channels", nil, body)
+	if first.Code != http.StatusOK || !strings.Contains(first.Body.String(), `"success":true`) {
+		t.Fatalf("first create status = %d body=%s", first.Code, first.Body.String())
+	}
+	second := postJSON(t, r, "/api/sub2api/peer-channels", nil, body)
+	if second.Code != http.StatusOK || !strings.Contains(second.Body.String(), `"success":true`) {
+		t.Fatalf("second create status = %d body=%s", second.Code, second.Body.String())
+	}
+	if !strings.Contains(second.Body.String(), `"idempotent_replay":true`) {
+		t.Fatalf("second response missing idempotent replay marker: %s", second.Body.String())
+	}
+
+	var channelCount int64
+	if err := db.Model(&model.Sub2APIPeerChannel{}).Where("provider_user_id = ?", userID).Count(&channelCount).Error; err != nil {
+		t.Fatalf("count peer channels: %v", err)
+	}
+	if channelCount != 1 {
+		t.Fatalf("peer channel count = %d, want 1", channelCount)
+	}
+	var user model.User
+	if err := db.First(&user, userID).Error; err != nil {
+		t.Fatalf("reload user: %v", err)
+	}
+	if user.ProviderLockedQuota != 70 {
+		t.Fatalf("provider_locked_quota = %d, want 70", user.ProviderLockedQuota)
+	}
+}
+
+func TestListSub2APIPeerChannels_ReturnsOnlyCurrentUserChannels(t *testing.T) {
+	db := openSub2APITestDB(t)
+	userID := seedSub2APITestUser(t, db, 100)
+	otherUserID := seedSub2APITestUser(t, db, 100)
+	if _, _, err := model.CreateSub2APIPeerChannelWithDeposit(model.Sub2APIPeerChannelCreateRequest{
+		ProviderUserId:     userID,
+		ProviderAccountId:  userID,
+		DisplayName:        "owned peer",
+		PeerEndpointURL:    "https://owned-peer.example.com/sub2api",
+		BackendID:          "backend-owned",
+		PeerPublicKey:      "owned-public-key",
+		SignatureScheme:    "ed25519-v1",
+		NonceWindowSeconds: 60,
+		SupportedModels:    `["gpt-4o-mini"]`,
+		ModelMapping:       `{}`,
+		CapacityConfig:     `{}`,
+		PricingTierID:      "tier-default",
+		RequiredDeposit:    40,
+		IdempotencyKey:     "owned-peer-list",
+	}); err != nil {
+		t.Fatalf("seed owned peer channel: %v", err)
+	}
+	if _, _, err := model.CreateSub2APIPeerChannelWithDeposit(model.Sub2APIPeerChannelCreateRequest{
+		ProviderUserId:     otherUserID,
+		ProviderAccountId:  otherUserID,
+		DisplayName:        "other peer",
+		PeerEndpointURL:    "https://other-peer.example.com/sub2api",
+		BackendID:          "backend-other",
+		PeerPublicKey:      "other-public-key",
+		SignatureScheme:    "ed25519-v1",
+		NonceWindowSeconds: 60,
+		SupportedModels:    `["gpt-4o-mini"]`,
+		ModelMapping:       `{}`,
+		CapacityConfig:     `{}`,
+		PricingTierID:      "tier-default",
+		RequiredDeposit:    40,
+		IdempotencyKey:     "other-peer-list",
+	}); err != nil {
+		t.Fatalf("seed other peer channel: %v", err)
+	}
+
+	r := gin.New()
+	r.GET("/api/sub2api/peer-channels", withUserContext(userID, controller.ListSub2APIPeerChannels))
+
+	rr := getHTTP(t, r, "/api/sub2api/peer-channels")
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"success":true`) {
+		t.Fatalf("list status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"display_name":"owned peer"`) {
+		t.Fatalf("list response missing owned peer: %s", rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), `"display_name":"other peer"`) {
+		t.Fatalf("list response leaked other user's peer: %s", rr.Body.String())
+	}
+}
+
+func TestGetSub2APIPeerChannel_RejectsOtherUserChannel(t *testing.T) {
+	db := openSub2APITestDB(t)
+	userID := seedSub2APITestUser(t, db, 100)
+	otherUserID := seedSub2APITestUser(t, db, 100)
+	otherChannel, _, err := model.CreateSub2APIPeerChannelWithDeposit(model.Sub2APIPeerChannelCreateRequest{
+		ProviderUserId:     otherUserID,
+		ProviderAccountId:  otherUserID,
+		DisplayName:        "other peer",
+		PeerEndpointURL:    "https://other-peer-detail.example.com/sub2api",
+		BackendID:          "backend-other-detail",
+		PeerPublicKey:      "other-public-key",
+		SignatureScheme:    "ed25519-v1",
+		NonceWindowSeconds: 60,
+		SupportedModels:    `["gpt-4o-mini"]`,
+		ModelMapping:       `{}`,
+		CapacityConfig:     `{}`,
+		PricingTierID:      "tier-default",
+		RequiredDeposit:    40,
+		IdempotencyKey:     "other-peer-detail",
+	})
+	if err != nil {
+		t.Fatalf("seed other peer channel: %v", err)
+	}
+
+	r := gin.New()
+	r.GET("/api/sub2api/peer-channels/:id", withUserContext(userID, controller.GetSub2APIPeerChannel))
+
+	rr := getHTTP(t, r, fmt.Sprintf("/api/sub2api/peer-channels/%d", otherChannel.Id))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("detail status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"success":false`) {
+		t.Fatalf("detail should reject other user's peer: %s", rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), `"display_name":"other peer"`) {
+		t.Fatalf("detail response leaked other user's peer: %s", rr.Body.String())
+	}
+}
+
+func TestVerifySub2APIPeerChannel_RecordsOwnershipVerified(t *testing.T) {
+	db := openSub2APITestDB(t)
+	t.Setenv("SUB2API_PEER_ALLOW_PRIVATE_ENDPOINTS", "1")
+	userID := seedSub2APITestUser(t, db, 100)
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate peer key: %v", err)
+	}
+	var channelID int
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/sub2api/internal/verify-challenge":
+			if r.Method != http.MethodPost {
+				http.NotFound(w, r)
+				return
+			}
+			var req map[string]string
+			if err := common.DecodeJson(r.Body, &req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if req["backend_id"] != "backend-verify" || req["channel_id"] != fmt.Sprintf("%d", channelID) {
+				http.Error(w, "unexpected challenge request", http.StatusBadRequest)
+				return
+			}
+			message := strings.Join([]string{req["challenge_id"], req["challenge_nonce"], req["backend_id"], req["channel_id"]}, "\n")
+			signature := ed25519.Sign(privateKey, []byte(message))
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"challenge_id":%q,"signature_scheme":"ed25519-v1","signature":%q}`, req["challenge_id"], base64.StdEncoding.EncodeToString(signature))))
+		case "/health":
+			_, _ = w.Write([]byte(`{"status":"online"}`))
+		case "/models":
+			_, _ = w.Write([]byte(`{"models":["gpt-4o-mini"]}`))
+		case "/capacity":
+			_, _ = w.Write([]byte(`{"capacity":{"rpm":60}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(peer.Close)
+
+	channel, _, err := model.CreateSub2APIPeerChannelWithDeposit(model.Sub2APIPeerChannelCreateRequest{
+		ProviderUserId:     userID,
+		ProviderAccountId:  userID,
+		DisplayName:        "verify peer",
+		PeerEndpointURL:    peer.URL,
+		BackendID:          "backend-verify",
+		PeerPublicKey:      base64.StdEncoding.EncodeToString(publicKey),
+		SignatureScheme:    "ed25519-v1",
+		NonceWindowSeconds: 60,
+		SupportedModels:    `["gpt-4o-mini"]`,
+		ModelMapping:       `{}`,
+		CapacityConfig:     `{}`,
+		PricingTierID:      "tier-default",
+		RequiredDeposit:    40,
+		IdempotencyKey:     "verify-peer-channel",
+	})
+	if err != nil {
+		t.Fatalf("seed peer channel: %v", err)
+	}
+	channelID = channel.Id
+
+	r := gin.New()
+	r.POST("/api/sub2api/peer-channels/:id/verify", withUserContext(userID, controller.VerifySub2APIPeerChannel))
+
+	rr := postJSON(t, r, fmt.Sprintf("/api/sub2api/peer-channels/%d/verify", channel.Id), nil, `{}`)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"success":true`) {
+		t.Fatalf("verify status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var reloaded model.Sub2APIPeerChannel
+	if err := db.First(&reloaded, channel.Id).Error; err != nil {
+		t.Fatalf("reload peer channel: %v", err)
+	}
+	if reloaded.OwnershipVerifiedAt == 0 {
+		t.Fatalf("ownership_verified_at not recorded: %+v", reloaded)
+	}
+	if reloaded.HealthStatus != model.Sub2APIPeerChannelHealthOnline {
+		t.Fatalf("health_status = %q, want %q", reloaded.HealthStatus, model.Sub2APIPeerChannelHealthOnline)
+	}
+	if reloaded.LastHealthCheckAt == 0 || reloaded.LastSuccessAt == 0 || reloaded.LastFailureAt != 0 {
+		t.Fatalf("health timestamps not recorded correctly: %+v", reloaded)
+	}
+	if reloaded.VerificationStatus != model.Sub2APIPeerChannelVerificationOwnershipVerified {
+		t.Fatalf("verification_status = %q, want %q", reloaded.VerificationStatus, model.Sub2APIPeerChannelVerificationOwnershipVerified)
+	}
+	if reloaded.RoutingStatus != model.Sub2APIPeerChannelRoutingDisabled {
+		t.Fatalf("ownership verification must not enable routing; channel=%+v", reloaded)
+	}
+}
+
+func TestVerifySub2APIPeerChannel_RejectsModelMismatch(t *testing.T) {
+	_ = openSub2APITestDB(t)
+	t.Setenv("SUB2API_PEER_ALLOW_PRIVATE_ENDPOINTS", "1")
+	userID := seedSub2APITestUser(t, model.DB, 100)
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate peer key: %v", err)
+	}
+	var channelID int
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/sub2api/internal/verify-challenge":
+			var req map[string]string
+			if err := common.DecodeJson(r.Body, &req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			message := strings.Join([]string{req["challenge_id"], req["challenge_nonce"], req["backend_id"], req["channel_id"]}, "\n")
+			signature := ed25519.Sign(privateKey, []byte(message))
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"challenge_id":%q,"signature_scheme":"ed25519-v1","signature":%q}`, req["challenge_id"], base64.StdEncoding.EncodeToString(signature))))
+		case "/health":
+			_, _ = w.Write([]byte(`{"status":"online"}`))
+		case "/models":
+			_, _ = w.Write([]byte(`{"models":["peer-other-model"]}`))
+		case "/capacity":
+			_, _ = w.Write([]byte(`{"capacity":{"rpm":60}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(peer.Close)
+
+	channel, _, err := model.CreateSub2APIPeerChannelWithDeposit(model.Sub2APIPeerChannelCreateRequest{
+		ProviderUserId:     userID,
+		ProviderAccountId:  userID,
+		DisplayName:        "mismatch peer",
+		PeerEndpointURL:    peer.URL,
+		BackendID:          "backend-mismatch",
+		PeerPublicKey:      base64.StdEncoding.EncodeToString(publicKey),
+		SignatureScheme:    "ed25519-v1",
+		NonceWindowSeconds: 60,
+		SupportedModels:    `["gpt-4o-mini"]`,
+		ModelMapping:       `{"gpt-4o-mini":"provider-model"}`,
+		CapacityConfig:     `{}`,
+		PricingTierID:      "tier-default",
+		RequiredDeposit:    40,
+		IdempotencyKey:     "verify-peer-model-mismatch",
+	})
+	if err != nil {
+		t.Fatalf("seed peer channel: %v", err)
+	}
+	channelID = channel.Id
+	_ = channelID
+
+	r := gin.New()
+	r.POST("/api/sub2api/peer-channels/:id/verify", withUserContext(userID, controller.VerifySub2APIPeerChannel))
+
+	rr := postJSON(t, r, fmt.Sprintf("/api/sub2api/peer-channels/%d/verify", channel.Id), nil, `{}`)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"success":false`) {
+		t.Fatalf("verify mismatch status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "model") {
+		t.Fatalf("verify mismatch response missing model error: %s", rr.Body.String())
+	}
+	var reloaded model.Sub2APIPeerChannel
+	if err := model.DB.First(&reloaded, channel.Id).Error; err != nil {
+		t.Fatalf("reload peer channel: %v", err)
+	}
+	if reloaded.OwnershipVerifiedAt != 0 || reloaded.VerificationStatus != model.Sub2APIPeerChannelVerificationPending {
+		t.Fatalf("model mismatch must not mark ownership verified; channel=%+v", reloaded)
+	}
+	var user model.User
+	if err := model.DB.First(&user, userID).Error; err != nil {
+		t.Fatalf("reload user: %v", err)
+	}
+	if user.ProviderLockedQuota != 0 || reloaded.DepositLockId != 0 {
+		t.Fatalf("pre-activation model mismatch should unlock deposit; user=%+v channel=%+v", user, reloaded)
+	}
+}
+
+func TestVerifySub2APIPeerChannel_RecordsHealthFailureMetadata(t *testing.T) {
+	_ = openSub2APITestDB(t)
+	t.Setenv("SUB2API_PEER_ALLOW_PRIVATE_ENDPOINTS", "1")
+	userID := seedSub2APITestUser(t, model.DB, 100)
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate peer key: %v", err)
+	}
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/sub2api/internal/verify-challenge":
+			var req map[string]string
+			if err := common.DecodeJson(r.Body, &req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			message := strings.Join([]string{req["challenge_id"], req["challenge_nonce"], req["backend_id"], req["channel_id"]}, "\n")
+			signature := ed25519.Sign(privateKey, []byte(message))
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"challenge_id":%q,"signature_scheme":"ed25519-v1","signature":%q}`, req["challenge_id"], base64.StdEncoding.EncodeToString(signature))))
+		case "/health":
+			_, _ = w.Write([]byte(`{"status":"offline"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(peer.Close)
+
+	channel, _, err := model.CreateSub2APIPeerChannelWithDeposit(model.Sub2APIPeerChannelCreateRequest{
+		ProviderUserId:     userID,
+		ProviderAccountId:  userID,
+		DisplayName:        "offline peer",
+		PeerEndpointURL:    peer.URL,
+		BackendID:          "backend-offline",
+		PeerPublicKey:      base64.StdEncoding.EncodeToString(publicKey),
+		SignatureScheme:    "ed25519-v1",
+		NonceWindowSeconds: 60,
+		SupportedModels:    `["gpt-4o-mini"]`,
+		ModelMapping:       `{}`,
+		CapacityConfig:     `{}`,
+		PricingTierID:      "tier-default",
+		RequiredDeposit:    40,
+		IdempotencyKey:     "verify-peer-health-failure",
+	})
+	if err != nil {
+		t.Fatalf("seed peer channel: %v", err)
+	}
+
+	r := gin.New()
+	r.POST("/api/sub2api/peer-channels/:id/verify", withUserContext(userID, controller.VerifySub2APIPeerChannel))
+
+	rr := postJSON(t, r, fmt.Sprintf("/api/sub2api/peer-channels/%d/verify", channel.Id), nil, `{}`)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"success":false`) {
+		t.Fatalf("verify offline status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var reloaded model.Sub2APIPeerChannel
+	if err := model.DB.First(&reloaded, channel.Id).Error; err != nil {
+		t.Fatalf("reload peer channel: %v", err)
+	}
+	if reloaded.HealthStatus != model.Sub2APIPeerChannelHealthOffline {
+		t.Fatalf("health_status = %q, want %q", reloaded.HealthStatus, model.Sub2APIPeerChannelHealthOffline)
+	}
+	if reloaded.LastHealthCheckAt == 0 || reloaded.LastFailureAt == 0 || reloaded.LastSuccessAt != 0 {
+		t.Fatalf("health failure timestamps not recorded correctly: %+v", reloaded)
+	}
+	if reloaded.OwnershipVerifiedAt != 0 || reloaded.VerificationStatus != model.Sub2APIPeerChannelVerificationPending {
+		t.Fatalf("health failure must not mark ownership verified; channel=%+v", reloaded)
+	}
+	var user model.User
+	if err := model.DB.First(&user, userID).Error; err != nil {
+		t.Fatalf("reload user: %v", err)
+	}
+	if user.ProviderLockedQuota != 0 || reloaded.DepositLockId != 0 {
+		t.Fatalf("pre-activation health failure should unlock deposit; user=%+v channel=%+v", user, reloaded)
+	}
+}
+
+func TestPauseAndResumeSub2APIPeerChannel_UpdateRoutingStatus(t *testing.T) {
+	db := openSub2APITestDB(t)
+	userID := seedSub2APITestUser(t, db, 100)
+	channel, _, err := model.CreateSub2APIPeerChannelWithDeposit(model.Sub2APIPeerChannelCreateRequest{
+		ProviderUserId:     userID,
+		ProviderAccountId:  userID,
+		DisplayName:        "pausable peer",
+		PeerEndpointURL:    "https://pausable-peer.example.com/sub2api",
+		BackendID:          "backend-pausable",
+		PeerPublicKey:      base64.StdEncoding.EncodeToString(make([]byte, ed25519.PublicKeySize)),
+		SignatureScheme:    "ed25519-v1",
+		NonceWindowSeconds: 60,
+		SupportedModels:    `["gpt-4o-mini"]`,
+		ModelMapping:       `{}`,
+		CapacityConfig:     `{}`,
+		PricingTierID:      "tier-default",
+		RequiredDeposit:    40,
+		IdempotencyKey:     "pause-resume-peer-channel",
+	})
+	if err != nil {
+		t.Fatalf("seed peer channel: %v", err)
+	}
+
+	r := gin.New()
+	r.POST("/api/sub2api/peer-channels/:id/pause", withUserContext(userID, controller.PauseSub2APIPeerChannel))
+	r.POST("/api/sub2api/peer-channels/:id/resume", withUserContext(userID, controller.ResumeSub2APIPeerChannel))
+
+	pause := postJSON(t, r, fmt.Sprintf("/api/sub2api/peer-channels/%d/pause", channel.Id), nil, `{}`)
+	if pause.Code != http.StatusOK || !strings.Contains(pause.Body.String(), `"success":true`) {
+		t.Fatalf("pause status = %d body=%s", pause.Code, pause.Body.String())
+	}
+	var paused model.Sub2APIPeerChannel
+	if err := db.First(&paused, channel.Id).Error; err != nil {
+		t.Fatalf("reload paused peer channel: %v", err)
+	}
+	if paused.RoutingStatus != model.Sub2APIPeerChannelRoutingPaused {
+		t.Fatalf("routing_status after pause = %q, want %q", paused.RoutingStatus, model.Sub2APIPeerChannelRoutingPaused)
+	}
+
+	resume := postJSON(t, r, fmt.Sprintf("/api/sub2api/peer-channels/%d/resume", channel.Id), nil, `{}`)
+	if resume.Code != http.StatusOK || !strings.Contains(resume.Body.String(), `"success":true`) {
+		t.Fatalf("resume status = %d body=%s", resume.Code, resume.Body.String())
+	}
+	var resumed model.Sub2APIPeerChannel
+	if err := db.First(&resumed, channel.Id).Error; err != nil {
+		t.Fatalf("reload resumed peer channel: %v", err)
+	}
+	if resumed.RoutingStatus != model.Sub2APIPeerChannelRoutingDisabled {
+		t.Fatalf("routing_status after resume = %q, want %q", resumed.RoutingStatus, model.Sub2APIPeerChannelRoutingDisabled)
+	}
+}
+
+func TestResumeSub2APIPeerChannel_ActivatesVerifiedHealthyChannel(t *testing.T) {
+	db := openSub2APITestDB(t)
+	userID := seedSub2APITestUser(t, db, 100)
+	channel, _, err := model.CreateSub2APIPeerChannelWithDeposit(model.Sub2APIPeerChannelCreateRequest{
+		ProviderUserId:     userID,
+		ProviderAccountId:  userID,
+		DisplayName:        "activatable peer",
+		PeerEndpointURL:    "https://activatable-peer.example.com/sub2api",
+		BackendID:          "backend-activatable",
+		PeerPublicKey:      base64.StdEncoding.EncodeToString(make([]byte, ed25519.PublicKeySize)),
+		SignatureScheme:    "ed25519-v1",
+		NonceWindowSeconds: 60,
+		SupportedModels:    `["gpt-4o-mini"]`,
+		ModelMapping:       `{}`,
+		CapacityConfig:     `{}`,
+		PricingTierID:      "tier-default",
+		RequiredDeposit:    40,
+		IdempotencyKey:     "activate-peer-channel",
+	})
+	if err != nil {
+		t.Fatalf("seed peer channel: %v", err)
+	}
+	if err := model.MarkSub2APIPeerChannelOwnershipVerified(channel.Id, userID); err != nil {
+		t.Fatalf("mark ownership verified: %v", err)
+	}
+	if err := model.UpdateSub2APIPeerChannelRoutingStatus(channel.Id, userID, model.Sub2APIPeerChannelRoutingPaused); err != nil {
+		t.Fatalf("mark paused: %v", err)
+	}
+
+	r := gin.New()
+	r.POST("/api/sub2api/peer-channels/:id/resume", withUserContext(userID, controller.ResumeSub2APIPeerChannel))
+
+	rr := postJSON(t, r, fmt.Sprintf("/api/sub2api/peer-channels/%d/resume", channel.Id), nil, `{}`)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"success":true`) {
+		t.Fatalf("resume status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var resumed model.Sub2APIPeerChannel
+	if err := db.First(&resumed, channel.Id).Error; err != nil {
+		t.Fatalf("reload resumed peer channel: %v", err)
+	}
+	if resumed.RoutingStatus != model.Sub2APIPeerChannelRoutingActive {
+		t.Fatalf("routing_status after verified resume = %q, want %q", resumed.RoutingStatus, model.Sub2APIPeerChannelRoutingActive)
+	}
+}
+
+func TestDeleteSub2APIPeerChannel_UnlocksDeposit(t *testing.T) {
+	db := openSub2APITestDB(t)
+	userID := seedSub2APITestUser(t, db, 100)
+	channel, lock, err := model.CreateSub2APIPeerChannelWithDeposit(model.Sub2APIPeerChannelCreateRequest{
+		ProviderUserId:     userID,
+		ProviderAccountId:  userID,
+		DisplayName:        "deletable peer",
+		PeerEndpointURL:    "https://deletable-peer.example.com/sub2api",
+		BackendID:          "backend-deletable",
+		PeerPublicKey:      base64.StdEncoding.EncodeToString(make([]byte, ed25519.PublicKeySize)),
+		SignatureScheme:    "ed25519-v1",
+		NonceWindowSeconds: 60,
+		SupportedModels:    `["gpt-4o-mini"]`,
+		ModelMapping:       `{}`,
+		CapacityConfig:     `{}`,
+		PricingTierID:      "tier-default",
+		RequiredDeposit:    40,
+		IdempotencyKey:     "delete-peer-channel",
+	})
+	if err != nil {
+		t.Fatalf("seed peer channel: %v", err)
+	}
+
+	r := gin.New()
+	r.DELETE("/api/sub2api/peer-channels/:id", withUserContext(userID, controller.DeleteSub2APIPeerChannel))
+
+	rr := deleteHTTP(t, r, fmt.Sprintf("/api/sub2api/peer-channels/%d", channel.Id))
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"success":true`) {
+		t.Fatalf("delete status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var user model.User
+	if err := db.First(&user, userID).Error; err != nil {
+		t.Fatalf("reload user: %v", err)
+	}
+	if user.ProviderLockedQuota != 0 {
+		t.Fatalf("provider_locked_quota after delete = %d, want 0", user.ProviderLockedQuota)
+	}
+	var reloadedLock model.ProviderEndpointDepositLock
+	if err := db.First(&reloadedLock, lock.Id).Error; err != nil {
+		t.Fatalf("reload lock: %v", err)
+	}
+	if reloadedLock.Status != model.ProviderEndpointDepositStatusUnlocked || reloadedLock.UnlockedAmount != 40 {
+		t.Fatalf("lock after delete = %+v, want unlocked amount 40", reloadedLock)
+	}
+	var count int64
+	if err := db.Model(&model.Sub2APIPeerChannel{}).Where("id = ?", channel.Id).Count(&count).Error; err != nil {
+		t.Fatalf("count peer channel: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("peer channel count after delete = %d, want 0", count)
+	}
+}
+
+func TestDeleteSub2APIPeerChannel_RejectsOtherUserChannel(t *testing.T) {
+	db := openSub2APITestDB(t)
+	userID := seedSub2APITestUser(t, db, 100)
+	otherUserID := seedSub2APITestUser(t, db, 100)
+	otherChannel, _, err := model.CreateSub2APIPeerChannelWithDeposit(model.Sub2APIPeerChannelCreateRequest{
+		ProviderUserId:     otherUserID,
+		ProviderAccountId:  otherUserID,
+		DisplayName:        "other deletable peer",
+		PeerEndpointURL:    "https://other-deletable-peer.example.com/sub2api",
+		BackendID:          "backend-other-deletable",
+		PeerPublicKey:      base64.StdEncoding.EncodeToString(make([]byte, ed25519.PublicKeySize)),
+		SignatureScheme:    "ed25519-v1",
+		NonceWindowSeconds: 60,
+		SupportedModels:    `["gpt-4o-mini"]`,
+		ModelMapping:       `{}`,
+		CapacityConfig:     `{}`,
+		PricingTierID:      "tier-default",
+		RequiredDeposit:    40,
+		IdempotencyKey:     "delete-other-peer-channel",
+	})
+	if err != nil {
+		t.Fatalf("seed other peer channel: %v", err)
+	}
+
+	r := gin.New()
+	r.DELETE("/api/sub2api/peer-channels/:id", withUserContext(userID, controller.DeleteSub2APIPeerChannel))
+
+	rr := deleteHTTP(t, r, fmt.Sprintf("/api/sub2api/peer-channels/%d", otherChannel.Id))
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"success":false`) {
+		t.Fatalf("delete other status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var count int64
+	if err := db.Model(&model.Sub2APIPeerChannel{}).Where("id = ?", otherChannel.Id).Count(&count).Error; err != nil {
+		t.Fatalf("count other peer channel: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("other peer channel count after rejected delete = %d, want 1", count)
+	}
+	var otherUser model.User
+	if err := db.First(&otherUser, otherUserID).Error; err != nil {
+		t.Fatalf("reload other user: %v", err)
+	}
+	if otherUser.ProviderLockedQuota != 40 {
+		t.Fatalf("other provider_locked_quota after rejected delete = %d, want 40", otherUser.ProviderLockedQuota)
 	}
 }
 
