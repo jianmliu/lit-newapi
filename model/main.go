@@ -283,6 +283,9 @@ func migrateDB() error {
 		&PerfMetric{},
 		&Sub2APISource{},
 		&Sub2APISourceGrant{},
+		&Sub2APIPeerChannel{},
+		&Sub2APIPeerUsage{},
+		&Sub2APIPeerReview{},
 		&ProviderEndpointDepositLock{},
 		&Withdrawal{},
 	)
@@ -334,6 +337,9 @@ func migrateDBFast() error {
 		{&CustomOAuthProvider{}, "CustomOAuthProvider"},
 		{&UserOAuthBinding{}, "UserOAuthBinding"},
 		{&PerfMetric{}, "PerfMetric"},
+		{&Sub2APIPeerChannel{}, "Sub2APIPeerChannel"},
+		{&Sub2APIPeerUsage{}, "Sub2APIPeerUsage"},
+		{&Sub2APIPeerReview{}, "Sub2APIPeerReview"},
 		{&ProviderEndpointDepositLock{}, "ProviderEndpointDepositLock"},
 	}
 	// 动态计算migration数量，确保errChan缓冲区足够大
