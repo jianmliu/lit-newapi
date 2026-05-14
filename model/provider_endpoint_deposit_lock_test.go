@@ -25,7 +25,7 @@ func openProviderEndpointDepositTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	if err := db.AutoMigrate(&User{}, &Sub2APISource{}, &ProviderEndpointDepositLock{}); err != nil {
+	if err := db.AutoMigrate(&User{}, &Sub2APISource{}, &Sub2APIPeerChannel{}, &Sub2APIPeerUsage{}, &Sub2APIPeerReview{}, &ProviderEndpointDepositLock{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	DB = db
@@ -39,7 +39,8 @@ func openProviderEndpointDepositTestDB(t *testing.T) *gorm.DB {
 
 func seedProviderEndpointDepositUser(t *testing.T, db *gorm.DB, quota int, usedQuota int) int {
 	t.Helper()
-	user := User{Username: "provider", Quota: quota, UsedQuota: usedQuota}
+	suffix := common.GetUUID()
+	user := User{Username: "provider-" + suffix, AffCode: suffix, Quota: quota, UsedQuota: usedQuota}
 	if err := db.Create(&user).Error; err != nil {
 		t.Fatalf("create user: %v", err)
 	}
@@ -201,6 +202,74 @@ func TestAttachProviderEndpointDepositLockCannotOverwriteSource(t *testing.T) {
 	}
 	if reloaded.SourceId != 10 || reloaded.EndpointID != "endpoint-1" {
 		t.Fatalf("second attach overwrote lock: %+v", reloaded)
+	}
+}
+
+func TestAttachProviderEndpointDepositLockToPeerChannelCannotOverwriteOrMixSource(t *testing.T) {
+	_ = openProviderEndpointDepositTestDB(t)
+	userID := seedProviderEndpointDepositUser(t, DB, 100, 0)
+	lock, err := LockProviderEndpointDeposit(userID, 40, "attach-peer-once")
+	if err != nil {
+		t.Fatalf("lock deposit: %v", err)
+	}
+	channel := Sub2APIPeerChannel{
+		ProviderUserId:     userID,
+		ProviderAccountId:  userID,
+		DisplayName:        "peer",
+		PeerEndpointURL:    "https://peer.example.com",
+		BackendID:          "backend-1",
+		PeerPublicKey:      "public-key",
+		SignatureScheme:    "ed25519-v1",
+		NonceWindowSeconds: 60,
+		SupportedModels:    `["gpt-4o-mini"]`,
+		ModelMapping:       `{"gpt-4o-mini":"provider-model"}`,
+		CapacityConfig:     `{"rpm":60}`,
+		PricingTierID:      "tier-default",
+		RequiredDeposit:    40,
+		HealthStatus:       Sub2APIPeerChannelHealthUnknown,
+		RoutingStatus:      Sub2APIPeerChannelRoutingDisabled,
+		VerificationStatus: Sub2APIPeerChannelVerificationPending,
+	}
+	if err := DB.Create(&channel).Error; err != nil {
+		t.Fatalf("create peer channel: %v", err)
+	}
+
+	if err := AttachProviderEndpointDepositLockToPeerChannel(lock.Id, channel.Id, channel.PeerEndpointURL, ""); err != nil {
+		t.Fatalf("attach peer channel: %v", err)
+	}
+	if err := AttachProviderEndpointDepositLockToPeerChannel(lock.Id, channel.Id+1, "https://other.example.com", ""); !errors.Is(err, ErrProviderEndpointDepositAlreadyAttached) {
+		t.Fatalf("second peer attach error = %v, want ErrProviderEndpointDepositAlreadyAttached", err)
+	}
+	if err := AttachProviderEndpointDepositLock(lock.Id, 10, "endpoint-source", ""); !errors.Is(err, ErrProviderEndpointDepositAlreadyAttached) {
+		t.Fatalf("source attach after peer attach error = %v, want ErrProviderEndpointDepositAlreadyAttached", err)
+	}
+
+	var reloaded ProviderEndpointDepositLock
+	if err := DB.First(&reloaded, lock.Id).Error; err != nil {
+		t.Fatalf("reload lock: %v", err)
+	}
+	if reloaded.PeerChannelId != channel.Id || reloaded.SourceId != 0 || reloaded.EndpointID != channel.PeerEndpointURL {
+		t.Fatalf("peer attach state mismatch: %+v", reloaded)
+	}
+}
+
+func TestProviderEndpointDepositIdempotencyAllowsReplayAfterPeerAttach(t *testing.T) {
+	_ = openProviderEndpointDepositTestDB(t)
+	userID := seedProviderEndpointDepositUser(t, DB, 100, 0)
+	lock, err := LockProviderEndpointDeposit(userID, 40, "same-peer-create")
+	if err != nil {
+		t.Fatalf("lock deposit: %v", err)
+	}
+	if err := AttachProviderEndpointDepositLockToPeerChannel(lock.Id, 12, "https://peer.example.com", ""); err != nil {
+		t.Fatalf("attach peer channel: %v", err)
+	}
+
+	replayed, err := LockProviderEndpointDeposit(userID, 40, "same-peer-create")
+	if err != nil {
+		t.Fatalf("replay after peer attach: %v", err)
+	}
+	if replayed.Id != lock.Id || replayed.PeerChannelId != 12 {
+		t.Fatalf("replay returned wrong lock: %+v", replayed)
 	}
 }
 

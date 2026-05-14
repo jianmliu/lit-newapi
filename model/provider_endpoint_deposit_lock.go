@@ -23,6 +23,7 @@ type ProviderEndpointDepositLock struct {
 	Id                 int    `json:"id"`
 	UserId             int    `json:"user_id" gorm:"index;uniqueIndex:idx_provider_endpoint_deposit_idempotency"`
 	SourceId           int    `json:"source_id" gorm:"index"`
+	PeerChannelId      int    `json:"peer_channel_id" gorm:"index"`
 	EndpointID         string `json:"endpoint_id" gorm:"type:varchar(191);index"`
 	RecordID           string `json:"record_id" gorm:"type:varchar(191);index"`
 	Amount             int    `json:"amount" gorm:"type:int;default:0"`
@@ -69,7 +70,7 @@ func LockProviderEndpointDeposit(userID int, amount int, idempotencyKey string) 
 			if lock.Amount != amount {
 				return ErrProviderEndpointDepositIdempotencyConflict
 			}
-			if lock.Status == ProviderEndpointDepositStatusLocked && lock.SourceId == 0 {
+			if lock.Status == ProviderEndpointDepositStatusLocked && lock.SourceId == 0 && lock.PeerChannelId == 0 {
 				return ErrProviderEndpointDepositProvisionInProgress
 			}
 			return nil
@@ -146,11 +147,33 @@ func AttachProviderEndpointDepositLock(lockID int, sourceID int, endpointID stri
 	if sourceID <= 0 {
 		return errors.New("invalid source id")
 	}
-	result := DB.Model(&ProviderEndpointDepositLock{}).Where("id = ? AND status = ? AND source_id = 0", lockID, ProviderEndpointDepositStatusLocked).Updates(map[string]interface{}{
+	result := DB.Model(&ProviderEndpointDepositLock{}).Where("id = ? AND status = ? AND source_id = 0 AND peer_channel_id = 0", lockID, ProviderEndpointDepositStatusLocked).Updates(map[string]interface{}{
 		"source_id":    sourceID,
 		"endpoint_id":  endpointID,
 		"record_id":    recordID,
 		"updated_time": common.GetTimestamp(),
+	})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrProviderEndpointDepositAlreadyAttached
+	}
+	return nil
+}
+
+func AttachProviderEndpointDepositLockToPeerChannel(lockID int, peerChannelID int, endpointID string, recordID string) error {
+	if lockID <= 0 {
+		return errors.New("invalid provider endpoint deposit lock id")
+	}
+	if peerChannelID <= 0 {
+		return errors.New("invalid peer channel id")
+	}
+	result := DB.Model(&ProviderEndpointDepositLock{}).Where("id = ? AND status = ? AND source_id = 0 AND peer_channel_id = 0", lockID, ProviderEndpointDepositStatusLocked).Updates(map[string]interface{}{
+		"peer_channel_id": peerChannelID,
+		"endpoint_id":     endpointID,
+		"record_id":       recordID,
+		"updated_time":    common.GetTimestamp(),
 	})
 	if result.Error != nil {
 		return result.Error
@@ -167,6 +190,21 @@ func UnlockProviderEndpointDepositForSource(sourceID int) error {
 	}
 	var lock ProviderEndpointDepositLock
 	result := DB.Where("source_id = ? AND status = ?", sourceID, ProviderEndpointDepositStatusLocked).Limit(1).Find(&lock)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return nil
+	}
+	return UnlockProviderEndpointDeposit(lock.Id)
+}
+
+func UnlockProviderEndpointDepositForPeerChannel(peerChannelID int) error {
+	if peerChannelID <= 0 {
+		return nil
+	}
+	var lock ProviderEndpointDepositLock
+	result := DB.Where("peer_channel_id = ? AND status = ?", peerChannelID, ProviderEndpointDepositStatusLocked).Limit(1).Find(&lock)
 	if result.Error != nil {
 		return result.Error
 	}
